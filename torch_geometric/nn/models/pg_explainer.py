@@ -14,7 +14,7 @@ from torch_geometric.utils import k_hop_subgraph, to_networkx
 class PGExplainer(torch.nn.Module):
     def __init__(self, model, epcohs: int = 100, lr: float = 0.01, 
                 num_hops: Optional[int] = None, temp: float = 1.0,
-                K: int = 5, log: bool = True):
+                K: int = 5, budget: float = 0.0, log: bool = True):
         super(PGExplainer, self).__init__()
         self.model = model
         self.epochs = epcohs
@@ -22,6 +22,7 @@ class PGExplainer(torch.nn.Module):
         self.__num_hops__ = num_hops
         self.temp = temp
         self.K = K
+        self.budget = budget
         self.log = log
 
     @property
@@ -96,6 +97,11 @@ class PGExplainer(torch.nn.Module):
         loss = -(self.Y[node_idx, :] * torch.log(y_pred_sub)).sum()
 
         # Graph sparsity constraint
+        if self.budget > 0:
+            loss += F.relu((self.edge_mask - torch.tile(self.budget, 
+                (self.edge_mask.size(0),))).sum())
+        else:
+            loss += self.edge_mask.sum()
 
         # Connectivity constraint
 
