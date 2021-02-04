@@ -21,7 +21,7 @@ class PGExplainer(torch.nn.Module):
         self.lr = lr
         self.__num_hops__ = num_hops
         self.temp = temp
-        self.K = k
+        self.K = K
         self.log = log
 
     @property
@@ -92,32 +92,64 @@ class PGExplainer(torch.nn.Module):
                 module.__edge_mask__ = None
         self.edge_mask = None
 
+    def __loss__(self, node_idx, edge_index, y_pred_sub):
+        loss = -(self.Y[node_idx, :] * torch.log(y_pred_sub)).sum()
+
+        # Graph sparsity constraint
+
+        # Connectivity constraint
+
+
     def train_explainer(self, x, edge_index, **kwargs):
         self.model.eval()
         self.to(x.device)
 
+        # Initial prediction and we create the explainer network
         with torch.no_grad():
             self.__build_explainer__(x, edge_index)
+
+        optimizer = torch.optim.Adam(self.explainer.parameters(),
+                                     lr=self.lr)
 
         self.comp_graphs = []
         self.x_neigh = []
         self.node_mapping = []
         for node in range(x.size(0)):
+            # Each node operates on a k-hop subgraph
             x, edge_index_sub, mapping, _, _ = self.__subgraph__(
                 node, x, edge_index, **kwargs)
             self.comp_graphs.append(edge_index_sub)
             self.x_neigh.append(x)
             self.node_mapping.append(mapping)
 
-        
         if self.log:
-            pbar = tqdm(total=self.epochs)
+            pbar = tqdm(range(self.epochs))
+        else:
+            pbar = range(self.epochs)
 
-        for _ in range(self.epochs):
+        for _ in pbar:
+            optimizer.zero_grad()
             loss = 0
             for node in range(x.size(0)):
                 omega = self.__get_params__(self.comp_graphs[node], node)
-                for k in range(self.K):
+                for _ in range(self.K):
+                    # Draw the edge mask and compute the MI loss
                     self.__set_masks__(omega)
                     y_pred_sub = self.model.call(self.x_neigh[node],
                         self.comp_graphs[node])[self.node_mapping[node]]
+                    loss += self.__loss__(node, self.comp_graphs[node], 
+                        y_pred_sub)
+
+            loss /= self.K * x.size(0)
+            loss.backward()
+            optimizer.step()
+
+            if self.log:
+                pbar.set_description("Loss: %.4f" % loss.item())
+        
+        self.__clear_masks__()
+
+    def explain(self, node_idx):
+        edge_index = self.comp_graphs[node_idx]
+        edge_mask = self.__get_params__(edge_index, node_idx)
+        return edge_mask, edge_index
