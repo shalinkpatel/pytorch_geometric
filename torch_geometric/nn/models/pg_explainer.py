@@ -1,6 +1,8 @@
 from typing import Optional
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -10,15 +12,16 @@ from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph, to_networkx
 
 class PGExplainer(torch.nn.Module):
-    def __init__(self, embed_model, output_model, epcohs: int = 100, 
-                lr: float = 0.01, num_hops: Optional[int] = None, 
-                log: bool = True):
+    def __init__(self, model, epcohs: int = 100, lr: float = 0.01, 
+                num_hops: Optional[int] = None, temp: float = 1.0,
+                K: int = 5, log: bool = True):
         super(PGExplainer, self).__init__()
-        self.embed_model = embed_model
-        self.output_model = output_model
+        self.model = model
         self.epochs = epcohs
         self.lr = lr
         self.__num_hops__ = num_hops
+        self.temp = temp
+        self.K = k
         self.log = log
 
     @property
@@ -54,3 +57,67 @@ class PGExplainer(torch.nn.Module):
             kwargs[key] = item
 
         return x, edge_index, mapping, edge_mask, kwargs
+
+    def __build_explainer__(self, x, edge_index):
+        self.Z = self.model.embed(x, edge_index)
+        self.Y = self.model.call(x, edge_index)
+
+        self.explainer = nn.Sequential(nn.Linear(3 * self.Z.size(1), 64,
+                                    nn.ReLU(),
+                                    nn.Linear(64, 20),
+                                    nn.ReLU(),
+                                    nn.Linear(20, 1))).to(x.device)
+
+    def __get_params__(self, edge_index, node_idx):
+        z_i = self.Z[edge_index[0, :], :]
+        z_j = self.Z[edge_index[1, :], :]
+        z_v = self.Z[node_idx, :].tile(1, edge_index.size(1))
+
+        return self.explainer(torch.cat([z_i, z_j, z_v])).reshape(-1)
+
+    def __set_masks__(self, omega):
+        eps = nn.Parameter(torch.rand(omega.size(), device=omega.device))
+        self.edge_mask = F.sigmoid((torch.log(eps) - torch.log(1 - eps) 
+            + omega) / self.temp)
+        
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                module.__explain__ = True
+                module.__edge_mask__ = self.edge_mask
+    
+    def __clear_masks__(self):
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                module.__explain__ = False
+                module.__edge_mask__ = None
+        self.edge_mask = None
+
+    def train_explainer(self, x, edge_index, **kwargs):
+        self.model.eval()
+        self.to(x.device)
+
+        with torch.no_grad():
+            self.__build_explainer__(x, edge_index)
+
+        self.comp_graphs = []
+        self.x_neigh = []
+        self.node_mapping = []
+        for node in range(x.size(0)):
+            x, edge_index_sub, mapping, _, _ = self.__subgraph__(
+                node, x, edge_index, **kwargs)
+            self.comp_graphs.append(edge_index_sub)
+            self.x_neigh.append(x)
+            self.node_mapping.append(mapping)
+
+        
+        if self.log:
+            pbar = tqdm(total=self.epochs)
+
+        for _ in range(self.epochs):
+            loss = 0
+            for node in range(x.size(0)):
+                omega = self.__get_params__(self.comp_graphs[node], node)
+                for k in range(self.K):
+                    self.__set_masks__(omega)
+                    y_pred_sub = self.model.call(self.x_neigh[node],
+                        self.comp_graphs[node])[self.node_mapping[node]]
