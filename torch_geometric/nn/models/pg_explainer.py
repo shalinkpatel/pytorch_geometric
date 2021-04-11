@@ -21,7 +21,7 @@ class PGExplainer(torch.nn.Module):
         'edge_size': 0.05,
     }
 
-    def __init__(self, model, epcohs: int = 30, lr: float = 0.01, 
+    def __init__(self, model, epcohs: int = 20, lr: float = 0.001, 
                 num_hops: Optional[int] = None, temp: float = 3.0,
                 K: int = 5, budget: float = -1.0, log: bool = True):
         super(PGExplainer, self).__init__()
@@ -107,10 +107,10 @@ class PGExplainer(torch.nn.Module):
 
         # Graph sparsity constraint
         if self.budget > 0:
-            size_loss = F.relu((self.edge_mask - torch.tile(self.budget, 
-                (self.edge_mask.size(0),))).sum())
+            size_loss = F.relu((self.edge_mask.abs() - torch.tile(
+                self.budget, (self.edge_mask.size(0),))).sum())
         else:
-            size_loss = self.edge_mask.sum()
+            size_loss = self.edge_mask.abs().sum()
 
         # Connectivity constraint
         # Figure out later
@@ -158,7 +158,7 @@ class PGExplainer(torch.nn.Module):
                     loss += self.__loss__(node, self.comp_graphs[node], 
                         y_pred_sub)
 
-            loss /= self.K * x.size(0) ** 2
+            loss /= self.K * x.size(0)
             loss.backward()
             optimizer.step()
 
@@ -170,7 +170,7 @@ class PGExplainer(torch.nn.Module):
     def explain(self, node_idx):
         edge_index = self.comp_graphs[node_idx]
         edge_mask = self.__get_params__(edge_index, node_idx)
-        return torch.sigmoid(edge_mask)
+        return edge_mask.sigmoid()
 
     def visualize_subgraph(self, node_idx, edge_index, edge_mask, y=None,
                            threshold=None, **kwargs):
