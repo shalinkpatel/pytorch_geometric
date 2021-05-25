@@ -50,6 +50,8 @@ class DataLoader(torch.utils.data.DataLoader):
             vectors for each key in the list. (default: :obj:`[]`)
         exclude_keys (list or tuple, optional): Will exclude each key in the
             list. (default: :obj:`[]`)
+        **kwargs (optional): Additional arguments of
+            :class:`torch.utils.data.DataLoader`.
     """
     def __init__(self, dataset, batch_size=1, shuffle=False, follow_batch=[],
                  exclude_keys=[], **kwargs):
@@ -59,11 +61,16 @@ class DataLoader(torch.utils.data.DataLoader):
 
         # Save for Pytorch Lightning...
         self.follow_batch = follow_batch
+        self.exclude_keys = exclude_keys
 
         super(DataLoader,
               self).__init__(dataset, batch_size, shuffle,
                              collate_fn=Collater(follow_batch,
                                                  exclude_keys), **kwargs)
+
+
+def identity_collate(data_list):
+    return data_list
 
 
 class DataListLoader(torch.utils.data.DataLoader):
@@ -85,7 +92,7 @@ class DataListLoader(torch.utils.data.DataLoader):
     def __init__(self, dataset, batch_size=1, shuffle=False, **kwargs):
         super(DataListLoader,
               self).__init__(dataset, batch_size, shuffle,
-                             collate_fn=lambda data_list: data_list, **kwargs)
+                             collate_fn=identity_collate, **kwargs)
 
 
 class DenseCollater(object):

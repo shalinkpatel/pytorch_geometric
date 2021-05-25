@@ -1,6 +1,6 @@
-import copy
-import os.path as osp
 from typing import Optional
+
+import os.path as osp
 
 import torch
 from tqdm import tqdm
@@ -46,13 +46,18 @@ class GraphSAINTSampler(torch.utils.data.DataLoader):
                  sample_coverage: int = 0, save_dir: Optional[str] = None,
                  log: bool = True, **kwargs):
 
+        if 'collate_fn' in kwargs:
+            del kwargs['collate_fn']
+
         assert data.edge_index is not None
         assert 'node_norm' not in data
         assert 'edge_norm' not in data
+        assert not data.edge_index.is_cuda
 
         self.num_steps = num_steps
         self.__batch_size__ = batch_size
         self.sample_coverage = sample_coverage
+        self.save_dir = save_dir
         self.log = log
 
         self.N = N = data.num_nodes
@@ -63,8 +68,7 @@ class GraphSAINTSampler(torch.utils.data.DataLoader):
             value=torch.arange(self.E, device=data.edge_index.device),
             sparse_sizes=(N, N))
 
-        self.data = copy.copy(data)
-        self.data.edge_index = None
+        self.data = data
 
         super(GraphSAINTSampler,
               self).__init__(self, batch_size=1, collate_fn=self.__collate__,
@@ -104,6 +108,8 @@ class GraphSAINTSampler(torch.utils.data.DataLoader):
         data.edge_index = torch.stack([row, col], dim=0)
 
         for key, item in self.data:
+            if key == 'edge_index':
+                continue
             if isinstance(item, torch.Tensor) and item.size(0) == self.N:
                 data[key] = item[node_idx]
             elif isinstance(item, torch.Tensor) and item.size(0) == self.E:
@@ -140,7 +146,7 @@ class GraphSAINTSampler(torch.utils.data.DataLoader):
 
                     if self.log:  # pragma: no cover
                         pbar.update(node_idx.size(0))
-            num_samples += 200
+            num_samples += self.num_steps
 
         if self.log:  # pragma: no cover
             pbar.close()

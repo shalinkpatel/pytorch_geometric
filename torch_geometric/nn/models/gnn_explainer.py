@@ -4,7 +4,6 @@ from typing import Optional
 
 import torch
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import networkx as nx
 from torch_geometric.nn import MessagePassing
 from torch_geometric.data import Data
@@ -38,6 +37,11 @@ class GNNExplainer(torch.nn.Module):
             information based on the number of
             :class:`~torch_geometric.nn.conv.message_passing.MessagePassing`
             layers inside :obj:`model`. (default: :obj:`None`)
+        return_type (str, optional): Denotes the type of output from
+            :obj:`model`. Valid inputs are :obj:`"log_prob"` (the model returns
+            the logarithm of probabilities), :obj:`"prob"` (the model returns
+            probabilities) and :obj:`"raw"` (the model returns raw scores).
+            (default: :obj:`"log_prob"`)
         log (bool, optional): If set to :obj:`False`, will not log any learning
             progress. (default: :obj:`True`)
     """
@@ -52,12 +56,15 @@ class GNNExplainer(torch.nn.Module):
     }
 
     def __init__(self, model, epochs: int = 100, lr: float = 0.01,
-                 num_hops: Optional[int] = None, log: bool = True):
+                 num_hops: Optional[int] = None, return_type: str = 'log_prob',
+                 log: bool = True):
         super(GNNExplainer, self).__init__()
+        assert return_type in ['log_prob', 'prob', 'raw']
         self.model = model
         self.epochs = epochs
         self.lr = lr
         self.__num_hops__ = num_hops
+        self.return_type = return_type
         self.log = log
 
     def __set_masks__(self, x, edge_index, init="normal"):
@@ -117,7 +124,10 @@ class GNNExplainer(torch.nn.Module):
         return x, edge_index, mapping, edge_mask, kwargs
 
     def __loss__(self, node_idx, log_logits, pred_label):
-        loss = -log_logits[node_idx, pred_label[node_idx]]
+        # node_idx is -1 for explaining graphs
+        loss = -log_logits[
+            node_idx, pred_label[node_idx]] if node_idx == -1 else -log_logits[
+                0, pred_label[0]]
 
         m = self.edge_mask.sigmoid()
         edge_reduce = getattr(torch, self.coeffs['edge_reduction'])
@@ -132,6 +142,66 @@ class GNNExplainer(torch.nn.Module):
         loss = loss + self.coeffs['node_feat_ent'] * ent.mean()
 
         return loss
+
+    def __to_log_prob__(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.log_softmax(dim=-1) if self.return_type == 'raw' else x
+        x = x.log() if self.return_type == 'prob' else x
+        return x
+
+    def explain_graph(self, x, edge_index, **kwargs):
+        r"""Learns and returns a node feature mask and an edge mask that play a
+        crucial role to explain the prediction made by the GNN for a graph.
+
+        Args:
+            x (Tensor): The node feature matrix.
+            edge_index (LongTensor): The edge indices.
+            **kwargs (optional): Additional arguments passed to the GNN module.
+
+        :rtype: (:class:`Tensor`, :class:`Tensor`)
+        """
+
+        self.model.eval()
+        self.__clear_masks__()
+
+        # all nodes belong to same graph
+        batch = torch.zeros(x.shape[0], dtype=int, device=x.device)
+
+        # Get the initial prediction.
+        with torch.no_grad():
+            out = self.model(x=x, edge_index=edge_index, batch=batch, **kwargs)
+            log_logits = self.__to_log_prob__(out)
+            pred_label = log_logits.argmax(dim=-1)
+
+        self.__set_masks__(x, edge_index)
+        self.to(x.device)
+
+        optimizer = torch.optim.Adam([self.node_feat_mask, self.edge_mask],
+                                     lr=self.lr)
+
+        if self.log:  # pragma: no cover
+            pbar = tqdm(total=self.epochs)
+            pbar.set_description('Explain graph')
+
+        for epoch in range(1, self.epochs + 1):
+            optimizer.zero_grad()
+            h = x * self.node_feat_mask.view(1, -1).sigmoid()
+            out = self.model(x=h, edge_index=edge_index, batch=batch, **kwargs)
+            log_logits = self.__to_log_prob__(out)
+            loss = self.__loss__(-1, log_logits, pred_label)
+            loss.backward()
+            optimizer.step()
+
+            if self.log:  # pragma: no cover
+                pbar.update(1)
+
+        if self.log:  # pragma: no cover
+            pbar.close()
+
+        node_feat_mask = self.node_feat_mask.detach().sigmoid()
+        edge_mask = self.edge_mask.detach().sigmoid()
+
+        self.__clear_masks__()
+        return node_feat_mask, edge_mask
 
     def explain_node(self, node_idx, x, edge_index, **kwargs):
         r"""Learns and returns a node feature mask and an edge mask that play a
@@ -158,7 +228,8 @@ class GNNExplainer(torch.nn.Module):
 
         # Get the initial prediction.
         with torch.no_grad():
-            log_logits = self.model(x=x, edge_index=edge_index, **kwargs)
+            out = self.model(x=x, edge_index=edge_index, **kwargs)
+            log_logits = self.__to_log_prob__(out)
             pred_label = log_logits.argmax(dim=-1)
 
         self.__set_masks__(x, edge_index)
@@ -174,7 +245,8 @@ class GNNExplainer(torch.nn.Module):
         for epoch in range(1, self.epochs + 1):
             optimizer.zero_grad()
             h = x * self.node_feat_mask.view(1, -1).sigmoid()
-            log_logits = self.model(x=h, edge_index=edge_index, **kwargs)
+            out = self.model(x=h, edge_index=edge_index, **kwargs)
+            log_logits = self.__to_log_prob__(out)
             loss = self.__loss__(mapping, log_logits, pred_label)
             loss.backward()
             optimizer.step()
@@ -195,15 +267,17 @@ class GNNExplainer(torch.nn.Module):
 
     def visualize_subgraph(self, node_idx, edge_index, edge_mask, y=None,
                            threshold=None, **kwargs):
-        r"""Visualizes the subgraph around :attr:`node_idx` given an edge mask
+        r"""Visualizes the subgraph given an edge mask
         :attr:`edge_mask`.
 
         Args:
             node_idx (int): The node id to explain.
+                Set to :obj:`-1` to explain graph.
             edge_index (LongTensor): The edge indices.
             edge_mask (Tensor): The edge mask.
             y (Tensor, optional): The ground-truth node-prediction labels used
-                as node colorings. (default: :obj:`None`)
+                as node colorings. All nodes will have the same color
+                if :attr:`node_idx` is :obj:`-1`.(default: :obj:`None`).
             threshold (float, optional): Sets a threshold for visualizing
                 important edges. If set to :obj:`None`, will visualize all
                 edges with transparancy indicating the importance of edges.
@@ -213,13 +287,21 @@ class GNNExplainer(torch.nn.Module):
 
         :rtype: :class:`matplotlib.axes.Axes`, :class:`networkx.DiGraph`
         """
-
+        import matplotlib.pyplot as plt
         assert edge_mask.size(0) == edge_index.size(1)
 
-        # Only operate on a k-hop subgraph around `node_idx`.
-        subset, edge_index, _, hard_edge_mask = k_hop_subgraph(
-            node_idx, self.num_hops, edge_index, relabel_nodes=True,
-            num_nodes=None, flow=self.__flow__())
+        if node_idx == -1:
+            hard_edge_mask = torch.BoolTensor([True] * edge_index.size(1),
+                                              device=edge_mask.device)
+            subset = torch.arange(edge_index.max().item() + 1,
+                                  device=edge_index.device)
+            y = None
+
+        else:
+            # Only operate on a k-hop subgraph around `node_idx`.
+            subset, edge_index, _, hard_edge_mask = k_hop_subgraph(
+                node_idx, self.num_hops, edge_index, relabel_nodes=True,
+                num_nodes=None, flow=self.__flow__())
 
         edge_mask = edge_mask[hard_edge_mask]
 
